@@ -1,19 +1,29 @@
 package config
 
+import "github.com/ekkinox/yai/ai"
+
 const (
-	openai_key         = "OPENAI_KEY"
-	openai_model       = "OPENAI_MODEL"
-	openai_proxy       = "OPENAI_PROXY"
-	openai_temperature = "OPENAI_TEMPERATURE"
-	openai_max_tokens  = "OPENAI_MAX_TOKENS"
+	provider_type      = "PROVIDER_TYPE"
+	provider_key       = "PROVIDER_KEY"
+	provider_model     = "PROVIDER_MODEL"
+	provider_proxy     = "PROVIDER_PROXY"
+	provider_temperature = "PROVIDER_TEMPERATURE"
+	provider_max_tokens = "PROVIDER_MAX_TOKENS"
 )
 
 type AiConfig struct {
-	key         string
-	model       string
-	proxy       string
-	temperature float64
-	maxTokens   int
+	providerType ProviderType
+	key          string
+	model        string
+	proxy        string
+	temperature  float64
+	maxTokens    int
+}
+
+type ProviderType = ai.ProviderType
+
+func (c AiConfig) GetProviderType() ProviderType {
+	return c.providerType
 }
 
 func (c AiConfig) GetKey() string {

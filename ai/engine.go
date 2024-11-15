@@ -3,17 +3,13 @@ package ai
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
-	"net/http"
-	"net/url"
 	"regexp"
 	"strings"
 
+	"github.com/ekkinox/yai/ai/providers/groq"
 	"github.com/ekkinox/yai/config"
 	"github.com/ekkinox/yai/system"
-
 	"github.com/sashabaranov/go-openai"
 )
 
@@ -22,54 +18,67 @@ const noexec = "[noexec]"
 type Engine struct {
 	mode         EngineMode
 	config       *config.Config
-	client       *openai.Client
-	execMessages []openai.ChatCompletionMessage
-	chatMessages []openai.ChatCompletionMessage
+	provider     Provider
+	execMessages []Message
+	chatMessages []Message
 	channel      chan EngineChatStreamOutput
 	pipe         string
 	running      bool
 }
 
 func NewEngine(mode EngineMode, config *config.Config) (*Engine, error) {
-	var client *openai.Client
+	var provider Provider
+	var err error
 
-	if config.GetAiConfig().GetProxy() != "" {
+	switch config.GetAiConfig().GetProviderType() {
+	case OpenAIProvider:
+		provider, err = initializeOpenAIProvider(config)
+	case GroqProvider:
+		provider = groq.NewProvider(
+			config.GetAiConfig().GetKey(),
+			config.GetAiConfig().GetModel(),
+		)
+	default:
+		return nil, fmt.Errorf("unsupported provider type: %s", config.GetAiConfig().GetProviderType())
+	}
 
-		clientConfig := openai.DefaultConfig(config.GetAiConfig().GetKey())
-
-		proxyUrl, err := url.Parse(config.GetAiConfig().GetProxy())
-		if err != nil {
-			return nil, err
-		}
-
-		transport := &http.Transport{
-			Proxy: http.ProxyURL(proxyUrl),
-		}
-
-		clientConfig.HTTPClient = &http.Client{
-			Transport: transport,
-		}
-
-		client = openai.NewClientWithConfig(clientConfig)
-	} else {
-		client = openai.NewClient(config.GetAiConfig().GetKey())
+	if err != nil {
+		return nil, err
 	}
 
 	return &Engine{
 		mode:         mode,
 		config:       config,
-		client:       client,
-		execMessages: make([]openai.ChatCompletionMessage, 0),
-		chatMessages: make([]openai.ChatCompletionMessage, 0),
+		provider:     provider,
+		execMessages: make([]Message, 0),
+		chatMessages: make([]Message, 0),
 		channel:      make(chan EngineChatStreamOutput),
 		pipe:         "",
 		running:      false,
 	}, nil
 }
 
+func initializeOpenAIProvider(config *config.Config) (Provider, error) {
+	var client *openai.Client
+
+	if config.GetAiConfig().GetProxy() != "" {
+		clientConfig := openai.DefaultConfig(config.GetAiConfig().GetKey())
+		transport := &http.Transport{
+			Proxy: http.ProxyURL(proxyUrl),
+		}
+		clientConfig.HTTPClient = &http.Client{
+			Transport: transport,
+		}
+		client = openai.NewClientWithConfig(clientConfig)
+	} else {
+		client = openai.NewClient(config.GetAiConfig().GetKey())
+	}
+
+	return &openAIProvider{client: client}, nil
+}
+
 func (e *Engine) SetMode(mode EngineMode) *Engine {
 	e.mode = mode
-
 	return e
 }
 
@@ -83,7 +92,6 @@ func (e *Engine) GetChannel() chan EngineChatStreamOutput {
 
 func (e *Engine) SetPipe(pipe string) *Engine {
 	e.pipe = pipe
-
 	return e
 }
 
@@ -94,49 +102,40 @@ func (e *Engine) Interrupt() *Engine {
 		interrupt:  true,
 		executable: false,
 	}
-
 	e.running = false
-
 	return e
 }
 
 func (e *Engine) Clear() *Engine {
 	if e.mode == ExecEngineMode {
-		e.execMessages = []openai.ChatCompletionMessage{}
+		e.execMessages = []Message{}
 	} else {
-		e.chatMessages = []openai.ChatCompletionMessage{}
+		e.chatMessages = []Message{}
 	}
-
 	return e
 }
 
 func (e *Engine) Reset() *Engine {
-	e.execMessages = []openai.ChatCompletionMessage{}
-	e.chatMessages = []openai.ChatCompletionMessage{}
-
+	e.execMessages = []Message{}
+	e.chatMessages = []Message{}
 	return e
 }
 
 func (e *Engine) ExecCompletion(input string) (*EngineExecOutput, error) {
 	ctx := context.Background()
-
 	e.running = true
 
 	e.appendUserMessage(input)
 
-	resp, err := e.client.CreateChatCompletion(
+	resp, err := e.provider.CreateChatCompletion(
 		ctx,
-		openai.ChatCompletionRequest{
-			Model:     e.config.GetAiConfig().GetModel(),
-			MaxTokens: e.config.GetAiConfig().GetMaxTokens(),
-			Messages:  e.prepareCompletionMessages(),
-		},
+		e.prepareCompletionMessages(),
 	)
 	if err != nil {
 		return nil, err
 	}
 
-	content := resp.Choices[0].Message.Content
+	content := resp.Content
 	e.appendAssistantMessage(content)
 
 	var output EngineExecOutput
@@ -163,19 +162,14 @@ func (e *Engine) ExecCompletion(input string) (*EngineExecOutput, error) {
 
 func (e *Engine) ChatStreamCompletion(input string) error {
 	ctx := context.Background()
-
 	e.running = true
 
 	e.appendUserMessage(input)
 
-	req := openai.ChatCompletionRequest{
-		Model:     e.config.GetAiConfig().GetModel(),
-		MaxTokens: e.config.GetAiConfig().GetMaxTokens(),
-		Messages:  e.prepareCompletionMessages(),
-		Stream:    true,
-	}
-
-	stream, err := e.client.CreateChatCompletionStream(ctx, req)
+	stream, err := e.provider.CreateChatCompletionStream(
+		ctx,
+		e.prepareCompletionMessages(),
+	)
 	if err != nil {
 		return err
 	}
@@ -186,85 +180,75 @@ func (e *Engine) ChatStreamCompletion(input string) error {
 	for {
 		if e.running {
 			resp, err := stream.Recv()
-
-			if errors.Is(err, io.EOF) {
-				executable := false
-				if e.mode == ExecEngineMode {
-					if !strings.HasPrefix(output, noexec) && !strings.Contains(output, "\n") {
-						executable = true
-					}
-				}
-
-				e.channel <- EngineChatStreamOutput{
-					content:    "",
-					last:       true,
-					executable: executable,
-				}
-				e.running = false
-				e.appendAssistantMessage(output)
-
-				return nil
-			}
-
 			if err != nil {
+				if err == io.EOF {
+					executable := false
+					if e.mode == ExecEngineMode {
+						if !strings.HasPrefix(output, noexec) && !strings.Contains(output, "\n") {
+							executable = true
+						}
+					}
+
+					e.channel <- EngineChatStreamOutput{
+						content:    "",
+						last:       true,
+						executable: executable,
+					}
+					e.running = false
+					e.appendAssistantMessage(output)
+					return nil
+				}
 				e.running = false
 				return err
 			}
 
-			delta := resp.Choices[0].Delta.Content
-
-			output += delta
+			output += resp.Content
 
 			e.channel <- EngineChatStreamOutput{
-				content: delta,
+				content: resp.Content,
 				last:    false,
 			}
-
-			// time.Sleep(time.Microsecond * 100)
 		} else {
 			stream.Close()
-
 			return nil
 		}
 	}
 }
 
 func (e *Engine) appendUserMessage(content string) *Engine {
+	msg := Message{
+		Role:    "user",
+		Content: content,
+	}
+
 	if e.mode == ExecEngineMode {
-		e.execMessages = append(e.execMessages, openai.ChatCompletionMessage{
-			Role:    openai.ChatMessageRoleUser,
-			Content: content,
-		})
+		e.execMessages = append(e.execMessages, msg)
 	} else {
-		e.chatMessages = append(e.chatMessages, openai.ChatCompletionMessage{
-			Role:    openai.ChatMessageRoleUser,
-			Content: content,
-		})
+		e.chatMessages = append(e.chatMessages, msg)
 	}
 
 	return e
 }
 
 func (e *Engine) appendAssistantMessage(content string) *Engine {
+	msg := Message{
+		Role:    "assistant",
+		Content: content,
+	}
+
 	if e.mode == ExecEngineMode {
-		e.execMessages = append(e.execMessages, openai.ChatCompletionMessage{
-			Role:    openai.ChatMessageRoleAssistant,
-			Content: content,
-		})
+		e.execMessages = append(e.execMessages, msg)
 	} else {
-		e.chatMessages = append(e.chatMessages, openai.ChatCompletionMessage{
-			Role:    openai.ChatMessageRoleAssistant,
-			Content: content,
-		})
+		e.chatMessages = append(e.chatMessages, msg)
 	}
 
 	return e
 }
 
-func (e *Engine) prepareCompletionMessages() []openai.ChatCompletionMessage {
-	messages := []openai.ChatCompletionMessage{
+func (e *Engine) prepareCompletionMessages() []Message {
+	messages := []Message{
 		{
-			Role:    openai.ChatMessageRoleSystem,
+			Role:    "system",
 			Content: e.prepareSystemPrompt(),
 		},
 	}
@@ -272,8 +256,8 @@ func (e *Engine) prepareCompletionMessages() []openai.ChatCompletionMessage {
 	if e.pipe != "" {
 		messages = append(
 			messages,
-			openai.ChatCompletionMessage{
-				Role:    openai.ChatMessageRoleUser,
+			Message{
+				Role:    "user",
 				Content: e.preparePipePrompt(),
 			},
 		)
